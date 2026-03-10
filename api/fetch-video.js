@@ -1,289 +1,369 @@
-// api/fetch-video.js — V5: Uses proven extraction APIs
-// Instead of scraping Facebook (which blocks servers),
-// we call APIs that already solved this problem
+// api/fetch-video.js — V6
+// Uses snapsave.app + fdown.net APIs (proven working services)
 
 const https = require('https');
+const http = require('http');
+const querystring = require('querystring');
 
-/* ══════════════════════════════════════════
-   HTTPS POST/GET helper
-   ══════════════════════════════════════════ */
-function httpRequest(url, options = {}) {
+/* ═══════════════════════════════════════
+   HTTP helper with redirect support
+   ═══════════════════════════════════════ */
+function request(url, opts = {}) {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
-    const opts = {
+    const isHttps = parsed.protocol === 'https:';
+    const lib = isHttps ? https : http;
+
+    const reqOpts = {
       hostname: parsed.hostname,
-      port: parsed.port || 443,
+      port: parsed.port || (isHttps ? 443 : 80),
       path: parsed.pathname + parsed.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-      timeout: 15000,
+      method: opts.method || 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        ...opts.headers,
+      },
+      timeout: 20000,
     };
 
-    const req = https.request(opts, (res) => {
-      // Follow redirects
-      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-        return httpRequest(res.headers.location, options).then(resolve).catch(reject);
+    const req = lib.request(reqOpts, (res) => {
+      if ([301,302,303,307,308].includes(res.statusCode) && res.headers.location) {
+        let next = res.headers.location;
+        if (next.startsWith('/')) next = parsed.origin + next;
+        return request(next, opts).then(resolve).catch(reject);
       }
       const chunks = [];
       res.on('data', c => chunks.push(c));
-      res.on('end', () => {
-        const body = Buffer.concat(chunks).toString('utf-8');
-        resolve({ statusCode: res.statusCode, body, headers: res.headers });
-      });
+      res.on('end', () => resolve({
+        status: res.statusCode,
+        body: Buffer.concat(chunks).toString('utf-8'),
+        headers: res.headers,
+      }));
     });
-
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('Timeout')); });
-    if (options.body) req.write(options.body);
+    if (opts.body) req.write(opts.body);
     req.end();
   });
 }
 
-/* ══════════════════════════════════════════
-   METHOD 1: Cobalt API
-   (open-source, supports FB, IG, YT, etc)
-   ══════════════════════════════════════════ */
-async function tryCobalt(url) {
-  console.log('[COBALT] Trying...');
-  
-  const instances = [
-    'https://api.cobalt.tools',
-    'https://co.wuk.sh',
-  ];
-
-  for (const api of instances) {
-    try {
-      const res = await httpRequest(api, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        body: JSON.stringify({
-          url: url,
-          videoQuality: '720',
-          filenameStyle: 'basic',
-        }),
-      });
-
-      console.log(`[COBALT] ${api} → ${res.statusCode}`);
-      
-      if (res.statusCode === 200) {
-        const data = JSON.parse(res.body);
-        console.log('[COBALT] Status:', data.status);
-
-        // Direct redirect
-        if (data.status === 'redirect' && data.url) {
-          return { sd: data.url, hd: '', title: 'فيديو فيسبوك', source: 'cobalt' };
-        }
-
-        // Tunnel (proxied download)
-        if (data.status === 'tunnel' && data.url) {
-          return { sd: data.url, hd: '', title: 'فيديو فيسبوك', source: 'cobalt' };
-        }
-
-        // Picker (multiple options)
-        if (data.status === 'picker' && data.picker?.length) {
-          const videos = data.picker.filter(p => p.type === 'video');
-          if (videos.length > 0) {
-            return {
-              sd: videos[videos.length - 1]?.url || '',
-              hd: videos[0]?.url || '',
-              title: data.filename || 'فيديو فيسبوك',
-              source: 'cobalt',
-            };
-          }
-        }
-
-        // Stream
-        if (data.status === 'stream' && data.url) {
-          return { sd: data.url, hd: '', title: 'فيديو فيسبوك', source: 'cobalt' };
-        }
-      }
-    } catch (e) {
-      console.log(`[COBALT] ${api} error:`, e.message);
-    }
-  }
-  return null;
-}
-
-/* ══════════════════════════════════════════
-   METHOD 2: FBDown API approach
-   (replicate what fdown.net does)
-   ══════════════════════════════════════════ */
-async function tryFBDown(url) {
-  console.log('[FBDOWN] Trying...');
-
+/* ═══════════════════════════════════════
+   METHOD 1: SnapSave.app
+   ═══════════════════════════════════════ */
+async function trySnapSave(fbUrl) {
+  console.log('[SNAPSAVE] Starting...');
   try {
-    // Use the getfvid.com approach - post URL to their API
-    const postData = `url=${encodeURIComponent(url)}`;
-    
-    const res = await httpRequest('https://getfvid.com/api/get-video', {
+    // Step 1: Get the page token
+    const page = await request('https://snapsave.app/', {
+      headers: { 'Accept': 'text/html' },
+    });
+
+    // Extract token from form
+    const tokenMatch = page.body.match(/name="token"\s+value="([^"]+)"/);
+    const token = tokenMatch ? tokenMatch[1] : '';
+
+    // Step 2: Submit the URL
+    const postData = querystring.stringify({
+      url: fbUrl,
+      token: token,
+    });
+
+    const res = await request('https://snapsave.app/action.php', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://snapsave.app/',
+        'Origin': 'https://snapsave.app',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      body: postData,
+    });
+
+    console.log('[SNAPSAVE] Response status:', res.status, 'Length:', res.body.length);
+
+    if (res.body.length < 100) return null;
+
+    // Parse the response — it returns encoded JS/HTML
+    let html = res.body;
+
+    // Try to decode if it's base64 encoded
+    if (html.includes('eval(') || html.includes('decodeURIComponent')) {
+      // Extract the encoded string
+      const encodedMatch = html.match(/decodeURIComponent\(escape\(atob\("([^"]+)"\)\)\)/);
+      if (encodedMatch) {
+        try {
+          const decoded = Buffer.from(encodedMatch[1], 'base64').toString('utf-8');
+          html = decodeURIComponent(escape(decoded));
+        } catch(e) {
+          // Try direct base64
+          try { html = Buffer.from(encodedMatch[1], 'base64').toString('utf-8'); } catch(e2) {}
+        }
+      }
+
+      // Alternative decode pattern
+      const altMatch = html.match(/atob\("([^"]+)"\)/);
+      if (altMatch && !html.includes('fbcdn')) {
+        try { html += Buffer.from(altMatch[1], 'base64').toString('utf-8'); } catch(e) {}
+      }
+    }
+
+    // Extract video URLs from the decoded HTML
+    const results = { sd: '', hd: '', title: '' };
+
+    // HD link
+    const hdPatterns = [
+      /href="(https?:\/\/[^"]*fbcdn[^"]*)"[^>]*>.*?HD/gi,
+      /href="(https?:\/\/[^"]*fbcdn[^"]*)"[^>]*>\s*<[^>]*>\s*HD/gi,
+      /"(https?:\/\/[^"]*fbcdn\.net[^"]*)"[^}]*"hd"/gi,
+      /hd[_\s"':]*(?:url|src|href)['":\s]*(https?:\/\/[^"'\s]+fbcdn[^"'\s]+)/gi,
+    ];
+    
+    // SD link  
+    const sdPatterns = [
+      /href="(https?:\/\/[^"]*fbcdn[^"]*)"[^>]*>.*?SD/gi,
+      /href="(https?:\/\/[^"]*fbcdn[^"]*)"[^>]*>\s*<[^>]*>\s*SD/gi,
+      /"(https?:\/\/[^"]*fbcdn\.net[^"]*)"[^}]*"sd"/gi,
+      /sd[_\s"':]*(?:url|src|href)['":\s]*(https?:\/\/[^"'\s]+fbcdn[^"'\s]+)/gi,
+    ];
+
+    // Generic fbcdn links
+    const allLinks = [...html.matchAll(/(?:href|src)="(https?:\/\/[^"]*fbcdn\.net[^"]*\.mp4[^"]*)"/gi)];
+    const allRawLinks = [...html.matchAll(/(https?:\/\/[^\s"'<>]*fbcdn\.net[^\s"'<>]*\.mp4[^\s"'<>]*)/g)];
+
+    for (const p of hdPatterns) {
+      const m = p.exec(html);
+      if (m && m[1] && m[1].includes('fbcdn')) { results.hd = cleanFbUrl(m[1]); break; }
+    }
+    for (const p of sdPatterns) {
+      const m = p.exec(html);
+      if (m && m[1] && m[1].includes('fbcdn')) { results.sd = cleanFbUrl(m[1]); break; }
+    }
+
+    // Fallback to any fbcdn link
+    if (!results.sd && allLinks.length > 0) {
+      results.sd = cleanFbUrl(allLinks[0][1]);
+      if (allLinks.length > 1) results.hd = cleanFbUrl(allLinks[1][1]);
+    }
+    if (!results.sd && allRawLinks.length > 0) {
+      results.sd = cleanFbUrl(allRawLinks[0][1]);
+      if (allRawLinks.length > 1 && allRawLinks[1][1] !== allRawLinks[0][1]) {
+        results.hd = cleanFbUrl(allRawLinks[1][1]);
+      }
+    }
+
+    // Title
+    const titleMatch = html.match(/<[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)</i)
+      || html.match(/<h[1-3][^>]*>([^<]+)<\/h/i);
+    if (titleMatch) results.title = titleMatch[1].trim();
+
+    if (results.sd || results.hd) {
+      console.log('[SNAPSAVE] ✓ Found video!');
+      return results;
+    }
+
+    console.log('[SNAPSAVE] No fbcdn links found in response');
+    return null;
+  } catch(e) {
+    console.log('[SNAPSAVE] Error:', e.message);
+    return null;
+  }
+}
+
+/* ═══════════════════════════════════════
+   METHOD 2: getfvid.com
+   ═══════════════════════════════════════ */
+async function tryGetFvid(fbUrl) {
+  console.log('[GETFVID] Starting...');
+  try {
+    const postData = querystring.stringify({ url: fbUrl });
+
+    const res = await request('https://getfvid.com/downloader', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
         'Referer': 'https://getfvid.com/',
         'Origin': 'https://getfvid.com',
       },
       body: postData,
     });
 
-    if (res.statusCode === 200) {
-      const data = JSON.parse(res.body);
-      if (data.success || data.sd || data.hd) {
+    console.log('[GETFVID] Status:', res.status, 'Len:', res.body.length);
+
+    const html = res.body;
+    const results = { sd: '', hd: '', title: '' };
+
+    // Extract download links
+    const downloadLinks = [...html.matchAll(/href="(https?:\/\/[^"]*fbcdn[^"]*)"/gi)];
+    
+    if (downloadLinks.length >= 1) results.sd = cleanFbUrl(downloadLinks[0][1]);
+    if (downloadLinks.length >= 2) results.hd = cleanFbUrl(downloadLinks[1][1]);
+
+    // Also check for direct video links
+    const directLinks = [...html.matchAll(/(https?:\/\/video[^"'\s]*fbcdn\.net[^"'\s]*)/g)];
+    if (!results.sd && directLinks.length > 0) results.sd = cleanFbUrl(directLinks[0][1]);
+    if (!results.hd && directLinks.length > 1) results.hd = cleanFbUrl(directLinks[1][1]);
+
+    const titleM = html.match(/<p[^>]*class="[^"]*card-text[^"]*"[^>]*>([^<]+)/i);
+    if (titleM) results.title = titleM[1].trim();
+
+    if (results.sd || results.hd) {
+      console.log('[GETFVID] ✓ Found!');
+      return results;
+    }
+    return null;
+  } catch(e) {
+    console.log('[GETFVID] Error:', e.message);
+    return null;
+  }
+}
+
+/* ═══════════════════════════════════════
+   METHOD 3: fdownloader.net
+   ═══════════════════════════════════════ */
+async function tryFDownloader(fbUrl) {
+  console.log('[FDOWNLOADER] Starting...');
+  try {
+    // Get CSRF token first
+    const page = await request('https://fdownloader.net/', {
+      headers: { 'Accept': 'text/html' },
+    });
+    
+    const csrfMatch = page.body.match(/name="csrf[_-]token"[^>]*value="([^"]+)"/i)
+      || page.body.match(/name="_token"[^>]*value="([^"]+)"/i);
+
+    const postData = JSON.stringify({
+      url: fbUrl,
+      ...(csrfMatch ? { token: csrfMatch[1] } : {}),
+    });
+
+    const res = await request('https://fdownloader.net/api/ajaxSearch', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Referer': 'https://fdownloader.net/',
+        'Origin': 'https://fdownloader.net',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
+      body: postData,
+    });
+
+    console.log('[FDOWNLOADER] Status:', res.status);
+
+    if (res.status === 200) {
+      let data;
+      try { data = JSON.parse(res.body); } catch { data = {}; }
+
+      const html = data.data || data.html || res.body;
+      const results = { sd: '', hd: '', title: data.title || '' };
+
+      // Parse links from response HTML
+      const links = [...html.matchAll(/href="(https?:\/\/[^"]*fbcdn[^"]*)"/gi)];
+      const rawLinks = [...html.matchAll(/(https?:\/\/[^\s"'<>]*fbcdn\.net[^\s"'<>]*\.mp4[^\s"'<>]*)/g)];
+
+      if (links.length >= 1) results.sd = cleanFbUrl(links[0][1]);
+      if (links.length >= 2) results.hd = cleanFbUrl(links[1][1]);
+      if (!results.sd && rawLinks.length > 0) results.sd = cleanFbUrl(rawLinks[0][1]);
+
+      if (results.sd || results.hd) {
+        console.log('[FDOWNLOADER] ✓ Found!');
+        return results;
+      }
+    }
+    return null;
+  } catch(e) {
+    console.log('[FDOWNLOADER] Error:', e.message);
+    return null;
+  }
+}
+
+/* ═══════════════════════════════════════
+   METHOD 4: fbdownloader.app
+   ═══════════════════════════════════════ */
+async function tryFBDownloaderApp(fbUrl) {
+  console.log('[FBDL-APP] Starting...');
+  try {
+    const postData = querystring.stringify({ url: fbUrl });
+
+    const res = await request('https://fbdownloader.app/api/convert', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': 'https://fbdownloader.app/',
+        'Origin': 'https://fbdownloader.app',
+      },
+      body: postData,
+    });
+
+    console.log('[FBDL-APP] Status:', res.status);
+
+    if (res.status === 200) {
+      let data;
+      try { data = JSON.parse(res.body); } catch { data = {}; }
+
+      if (data.sd || data.hd || data.url) {
         return {
           sd: data.sd || data.url || '',
           hd: data.hd || '',
           title: data.title || 'فيديو فيسبوك',
-          source: 'getfvid',
+        };
+      }
+
+      // Parse HTML response
+      const html = data.data || data.html || res.body;
+      const links = [...html.matchAll(/(https?:\/\/[^\s"'<>]*fbcdn\.net[^\s"'<>]*\.mp4[^\s"'<>]*)/g)];
+      if (links.length > 0) {
+        return {
+          sd: cleanFbUrl(links[0][1]),
+          hd: links.length > 1 ? cleanFbUrl(links[1][1]) : '',
+          title: data.title || 'فيديو فيسبوك',
         };
       }
     }
-  } catch (e) {
-    console.log('[FBDOWN] error:', e.message);
-  }
-  return null;
-}
-
-/* ══════════════════════════════════════════
-   METHOD 3: 9xbuddy / savefrom approach
-   ══════════════════════════════════════════ */
-async function try9xbuddy(url) {
-  console.log('[9XBUDDY] Trying...');
-  
-  try {
-    const apiUrl = `https://9xbuddy.in/process?url=${encodeURIComponent(url)}`;
-    const res = await httpRequest(apiUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://9xbuddy.in/',
-      },
-    });
-
-    if (res.statusCode === 200) {
-      const data = JSON.parse(res.body);
-      if (data.url || data.urls?.length) {
-        const urls = data.urls || [data];
-        const sdUrl = urls.find(u => u.quality === 'sd' || u.quality === '360p')?.url || urls[0]?.url || '';
-        const hdUrl = urls.find(u => u.quality === 'hd' || u.quality === '720p')?.url || '';
-        if (sdUrl || hdUrl) {
-          return { sd: sdUrl, hd: hdUrl, title: data.title || 'فيديو فيسبوك', source: '9xbuddy' };
-        }
-      }
-    }
+    return null;
   } catch(e) {
-    console.log('[9XBUDDY] error:', e.message);
+    console.log('[FBDL-APP] Error:', e.message);
+    return null;
   }
-  return null;
 }
 
-/* ══════════════════════════════════════════
-   METHOD 4: Direct scrape with better patterns
-   (using mbasic with enhanced cookie simulation)
-   ══════════════════════════════════════════ */
-async function tryDirectScrape(url) {
-  console.log('[SCRAPE] Trying direct...');
-  
-  const crypto = require('crypto');
-  const datr = crypto.randomBytes(12).toString('base64').replace(/[+/=]/g, 'x');
-  
-  // Resolve share URL first
-  let targetUrl = url;
-  try {
-    const resolveRes = await httpRequest(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.6167.178 Mobile Safari/537.36',
-        'Cookie': `datr=${datr}; locale=en_US;`,
-      },
-    });
-    // Try to extract video ID from response
-    const vidIdMatch = resolveRes.body.match(/video_id=(\d{10,})/) 
-      || resolveRes.body.match(/\/videos\/(\d{10,})/)
-      || resolveRes.body.match(/"videoId"\s*:\s*"(\d{10,})"/)
-      || resolveRes.body.match(/v=(\d{10,})/);
-    
-    if (vidIdMatch) {
-      targetUrl = `https://mbasic.facebook.com/watch/?v=${vidIdMatch[1]}`;
-    }
-  } catch(e) {}
-
-  // Now try mbasic
-  try {
-    const mUrl = targetUrl.replace(/(?:www|m|web|touch)\.facebook\.com/g, 'mbasic.facebook.com');
-    const res = await httpRequest(mUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 4.4.2; Nexus 5 Build/KOT49H) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2490.76 Mobile Safari/537.36',
-        'Cookie': `datr=${datr}; locale=en_US;`,
-        'Accept': 'text/html',
-      },
-    });
-
-    const html = res.body;
-    let sd = '', hd = '', title = '';
-
-    // video_redirect
-    const redirects = [...html.matchAll(/href="(\/video_redirect\/\?src=[^"]+)"/gi)];
-    for (const m of redirects) {
-      const srcM = m[1].match(/src=([^&"]+)/);
-      if (srcM) {
-        try { const u = decodeURIComponent(srcM[1]); if (u.includes('fbcdn')) { if (!sd) sd = u; else if (!hd) hd = u; } } catch(e) {}
-      }
-    }
-
-    // sd_src / hd_src
-    if (!sd) { const m = html.match(/"sd_src":"([^"]+)"/); if (m) sd = m[1].replace(/\\\//g, '/'); }
-    if (!hd) { const m = html.match(/"hd_src":"([^"]+)"/); if (m) hd = m[1].replace(/\\\//g, '/'); }
-    if (!sd) { const m = html.match(/playable_url":"([^"]+)"/); if (m) sd = m[1].replace(/\\\//g, '/'); }
-
-    // Title
-    const t = html.match(/<title>([^<]+)<\/title>/i);
-    if (t) title = t[1].replace(/\s*[-|]?\s*Facebook.*$/i, '').trim();
-
-    if (sd || hd) {
-      return { sd, hd, title: title || 'فيديو فيسبوك', source: 'scrape' };
-    }
-  } catch(e) {
-    console.log('[SCRAPE] error:', e.message);
-  }
-  return null;
+/* ═══════════════════════════════════════
+   URL Cleanup
+   ═══════════════════════════════════════ */
+function cleanFbUrl(url) {
+  if (!url) return '';
+  return url.replace(/&amp;/g, '&').replace(/\\\//g, '/').replace(/\\u002F/g, '/').replace(/\\u0026/g, '&').trim();
 }
 
-/* ══════════════════════════════════════════
-   MASTER: Try all methods
-   ══════════════════════════════════════════ */
+/* ═══════════════════════════════════════
+   MASTER: Run all methods
+   ═══════════════════════════════════════ */
 async function extractVideo(url) {
   const methods = [
-    { name: 'cobalt', fn: () => tryCobalt(url) },
-    { name: 'getfvid', fn: () => tryFBDown(url) },
-    { name: '9xbuddy', fn: () => try9xbuddy(url) },
-    { name: 'scrape', fn: () => tryDirectScrape(url) },
+    { name: 'SnapSave', fn: () => trySnapSave(url) },
+    { name: 'GetFvid', fn: () => tryGetFvid(url) },
+    { name: 'FDownloader', fn: () => tryFDownloader(url) },
+    { name: 'FBDownloaderApp', fn: () => tryFBDownloaderApp(url) },
   ];
 
-  const results = [];
-
-  for (const method of methods) {
-    console.log(`[MASTER] Trying ${method.name}...`);
+  for (const m of methods) {
+    console.log(`\n[MASTER] ═══ ${m.name} ═══`);
     try {
-      const result = await method.fn();
+      const result = await m.fn();
       if (result && (result.sd || result.hd)) {
-        console.log(`[MASTER] ✓ ${method.name} succeeded!`);
-        return result;
+        console.log(`[MASTER] ✓ ${m.name} succeeded!`);
+        return { ...result, source: m.name };
       }
-      results.push({ method: method.name, status: 'no_video' });
     } catch(e) {
-      console.log(`[MASTER] ✗ ${method.name}:`, e.message);
-      results.push({ method: method.name, status: 'error', error: e.message });
+      console.log(`[MASTER] ✗ ${m.name}: ${e.message}`);
     }
   }
 
-  console.log('[MASTER] All methods failed:', JSON.stringify(results));
   return null;
 }
 
-/* ══════════════════════════════════════════
+/* ═══════════════════════════════════════
    VERCEL HANDLER
-   ══════════════════════════════════════════ */
+   ═══════════════════════════════════════ */
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -295,7 +375,7 @@ module.exports = async (req, res) => {
   try {
     const { url } = req.body || {};
     if (!url) return res.status(400).json({ error: 'أدخل رابط الفيديو' });
-    if (!['facebook.com', 'fb.watch', 'fb.com', 'fb.me'].some(d => url.includes(d))) {
+    if (!['facebook.com','fb.watch','fb.com','fb.me'].some(d => url.includes(d))) {
       return res.status(400).json({ error: 'رابط غير صالح' });
     }
 
@@ -319,9 +399,8 @@ module.exports = async (req, res) => {
       preview: video.sd || video.hd,
       source: video.source,
     });
-
-  } catch (err) {
+  } catch(err) {
     console.error('[ERROR]', err);
-    return res.status(500).json({ error: 'خطأ بالسيرفر', message: err.message });
+    return res.status(500).json({ error: 'خطأ', message: err.message });
   }
 };
