@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/fetch-video.js": {
+      "maxDuration": 30
+    }
+  }
+}
